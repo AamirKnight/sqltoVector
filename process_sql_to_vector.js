@@ -1,38 +1,54 @@
 // process_sql_to_vector.js
-// Handles SQL format where each row is on its own line:
-//   INSERT INTO `table` (`col1`, `col2`, ...) VALUES
-//   (val1, val2, ...),
-//   (val1, val2, ...);
+// Saves vectors to a local SQLite file using better-sqlite3
+// No ChromaDB server needed — pure local file
 
 const fs = require("fs");
 const readline = require("readline");
 const axios = require("axios");
 const crypto = require("crypto");
-const { ChromaClient } = require("chromadb");
+const path = require("path");
 const pLimit = require("p-limit").default;
+const Database = require("better-sqlite3");
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
-const FILE_PATH = process.env.SQL_FILE || "./airtelnoc.sql";
-const EMBED_URL  = process.env.EMBED_URL  || "http://localhost:8000/embed";
-const COLLECTION_NAME = process.env.COLLECTION || "sql_data";
+const FILE_PATH       = process.env.SQL_FILE    || "./airtelnoc.sql";
+const EMBED_URL       = process.env.EMBED_URL   || "http://localhost:8000/embed";
+const DB_PATH         = process.env.DB_PATH     || "./vectors.db";
 const CHECKPOINT_FILE = "./checkpoint.json";
 
-const BATCH_SIZE      = 50;
-const CONCURRENCY     = 3;
-const EMBED_TIMEOUT   = 30000;
+const BATCH_SIZE    = 50;
+const CONCURRENCY   = 3;
+const EMBED_TIMEOUT = 30000;
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Column names we care about (text/meaningful fields from monthly_template)
+const limit = pLimit(CONCURRENCY);
+
 const SKIP_COLS = new Set([
   "id", "year", "is_deleted", "project_id", "circle_id",
   "created_by", "updated_by",
 ]);
 
-const client = new ChromaClient({ host: "localhost", port: 8001 });
-const limit  = pLimit(CONCURRENCY);
-let collection;
-let columnNames = []; // extracted from INSERT header
+let columnNames = [];
 let inValues    = false;
+let db;
+let insertStmt;
+
+// ── DB setup ──────────────────────────────────────────────────────────────────
+function initDB() {
+  db = new Database(DB_PATH);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS vectors (
+      id TEXT PRIMARY KEY,
+      document TEXT NOT NULL,
+      embedding BLOB NOT NULL
+    )
+  `);
+  insertStmt = db.prepare(`
+    INSERT OR REPLACE INTO vectors (id, document, embedding)
+    VALUES (@id, @document, @embedding)
+  `);
+  console.log(`SQLite vector DB ready: ${DB_PATH}`);
+}
 
 // ── Checkpoint ────────────────────────────────────────────────────────────────
 function loadCheckpoint() {
@@ -43,50 +59,40 @@ function saveCheckpoint(data) {
   fs.writeFileSync(CHECKPOINT_FILE, JSON.stringify(data, null, 2));
 }
 
-// ── Extract column names from INSERT header ───────────────────────────────────
-// e.g. INSERT INTO `monthly_template` (`id`, `dates`, ...) VALUES
+// ── SQL parsing ───────────────────────────────────────────────────────────────
 function parseColumns(line) {
-  const match = line.match(/INSERT INTO `\w+` \((.+?)\)\s+VALUES/i);
+  const match = line.match(/INSERT INTO `\w+`\s*\((.+?)\)\s*VALUES/i);
   if (!match) return [];
   return match[1].split(",").map(c => c.trim().replace(/`/g, ""));
 }
 
-// ── Parse a value row line ────────────────────────────────────────────────────
-// e.g. (1,\t'2024-07-01',\t2024,\t'Q2', ...)
 function parseValueRow(line) {
-  const trimmed = line.trim().replace(/[,;)]+$/, "").replace(/^\(/, "");
-  
-  // Split by tab+comma or just comma, respecting single-quoted strings
+  const trimmed = line.trim().replace(/[,;]+$/, "").replace(/^\(/, "").replace(/\)$/, "");
   const values = [];
   let current = "";
   let inQuote = false;
-  
+
   for (let i = 0; i < trimmed.length; i++) {
     const ch = trimmed[i];
-    if (ch === "'" && trimmed[i-1] !== "\\") {
+    if (ch === "'" && trimmed[i - 1] !== "\\") {
       inQuote = !inQuote;
       current += ch;
-    } else if (ch === "," && !inQuote) {
-      values.push(current.trim());
-      current = "";
+    } else if ((ch === "," || ch === "\t") && !inQuote) {
+      if (ch === ",") { values.push(current.trim()); current = ""; }
     } else {
       current += ch;
     }
   }
   if (current.trim()) values.push(current.trim());
-  
-  return values.map(v => v.replace(/^'(.*)'$/, "$1").trim()); // strip quotes
+  return values.map(v => v.replace(/^'(.*)'$/s, "$1").trim());
 }
 
-// ── Build a readable text from a row ─────────────────────────────────────────
 function rowToText(values) {
   if (columnNames.length === 0) {
-    // No column names yet — just join non-numeric values
     return values
       .filter(v => v && v !== "NULL" && !/^\d{1,4}$/.test(v) && v !== "0000-00-00 00:00:00")
       .join(" | ");
   }
-
   const parts = [];
   for (let i = 0; i < columnNames.length && i < values.length; i++) {
     const col = columnNames[i];
@@ -103,11 +109,27 @@ function hashId(text) {
   return crypto.createHash("md5").update(text).digest("hex");
 }
 
+function float32ToBuffer(arr) {
+  const buf = Buffer.alloc(arr.length * 4);
+  arr.forEach((v, i) => buf.writeFloatLE(v, i * 4));
+  return buf;
+}
+
 async function embedAndStore(texts) {
   const res = await axios.post(EMBED_URL, { texts }, { timeout: EMBED_TIMEOUT });
   const embeddings = res.data.embeddings;
-  const ids = texts.map(hashId);
-  await collection.upsert({ ids, documents: texts, embeddings });
+
+  const insertMany = db.transaction((rows) => {
+    for (const row of rows) insertStmt.run(row);
+  });
+
+  const rows = texts.map((doc, i) => ({
+    id: hashId(doc),
+    document: doc,
+    embedding: float32ToBuffer(embeddings[i]),
+  }));
+
+  insertMany(rows);
   return texts.length;
 }
 
@@ -115,12 +137,12 @@ async function embedAndStore(texts) {
 function makeProgress(filePath) {
   const totalBytes = fs.statSync(filePath).size;
   let bytesRead = 0;
-  let chunksStored = 0;
+  let rowsStored = 0;
   const startTime = Date.now();
   return {
-    update(lineBytes, newChunks = 0) {
+    update(lineBytes, newRows = 0) {
       bytesRead += lineBytes;
-      chunksStored += newChunks;
+      rowsStored += newRows;
       const pct     = ((bytesRead / totalBytes) * 100).toFixed(1);
       const elapsed = (Date.now() - startTime) / 1000;
       const rate    = (bytesRead / elapsed / 1e6).toFixed(2);
@@ -129,7 +151,7 @@ function makeProgress(filePath) {
         : "?";
       process.stdout.write(
         `\r[${pct}%] ${(bytesRead/1e6).toFixed(1)}/${(totalBytes/1e6).toFixed(1)} MB` +
-        ` | ${chunksStored} rows stored | ${rate} MB/s | ETA ${eta}s   `
+        ` | ${rowsStored} rows | ${rate} MB/s | ETA ${eta}s   `
       );
     },
   };
@@ -137,15 +159,7 @@ function makeProgress(filePath) {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
-  console.log("Connecting to ChromaDB...");
-  collection = await client.getOrCreateCollection({
-    name: COLLECTION_NAME,
-    embeddingFunction: { generate: async (texts) => {
-      const res = await axios.post(EMBED_URL, { texts }, { timeout: EMBED_TIMEOUT });
-      return res.data.embeddings;
-    }},
-  });
-  console.log(`Collection '${COLLECTION_NAME}' ready.\n`);
+  initDB();
 
   const checkpoint = loadCheckpoint();
   const skipLines  = checkpoint.processedLines;
@@ -180,29 +194,38 @@ async function main() {
 
     const trimmed = line.trim();
 
-    // Detect INSERT header → extract column names
-    if (trimmed.toUpperCase().includes("INSERT INTO") && trimmed.toUpperCase().includes("VALUES")) {
+    // INSERT header with VALUES on same line
+    if (/INSERT INTO/i.test(trimmed) && /VALUES/i.test(trimmed)) {
       columnNames = parseColumns(trimmed);
       inValues = true;
+      // Check if values start on same line after VALUES
+      const afterValues = trimmed.replace(/.*VALUES\s*/i, "").trim();
+      if (afterValues.startsWith("(")) {
+        for (const rowText of afterValues.split(/\),\s*\(/).map((r, i, a) => {
+          return (i === 0 ? "" : "(") + r + (i === a.length - 1 ? "" : ")");
+        })) {
+          // handled below via inValues
+        }
+      }
       continue;
     }
 
-    // Detect start of VALUES block (VALUES on its own line)
-    if (trimmed.toUpperCase() === "VALUES" || trimmed.toUpperCase().startsWith("VALUES")) {
+    // VALUES keyword alone on a line
+    if (/^VALUES\s*$/i.test(trimmed)) {
       inValues = true;
       continue;
     }
 
-    // End of INSERT block
-    if (inValues && (trimmed === "" || trimmed.toUpperCase().startsWith("INSERT") || trimmed.startsWith("--") || trimmed.startsWith("/"))) {
+    // End of block
+    if (inValues && (trimmed === "" || /^INSERT/i.test(trimmed) || /^--/.test(trimmed) || /^\/\*/.test(trimmed))) {
       inValues = false;
     }
 
-    // Parse value rows: lines starting with (
+    // Value row
     if (inValues && trimmed.startsWith("(")) {
-      const values  = parseValueRow(trimmed);
-      const text    = rowToText(values);
-      if (text.length > 20) {
+      const values = parseValueRow(trimmed);
+      const text   = rowToText(values);
+      if (text.length > 15) {
         buffer.push(text);
         parsedRows++;
         if (buffer.length >= BATCH_SIZE) {
@@ -222,10 +245,13 @@ async function main() {
   await Promise.all(pending);
   saveCheckpoint({ processedLines: lineNum, storedChunks: totalStored });
 
+  const count = db.prepare("SELECT COUNT(*) as c FROM vectors").get();
+  db.close();
+
   console.log(`\n\nDONE`);
-  console.log(`  Rows parsed : ${parsedRows}`);
-  console.log(`  Chunks stored: ${totalStored}`);
-  console.log(`  Collection  : ${COLLECTION_NAME}`);
+  console.log(`  SQL rows parsed : ${parsedRows}`);
+  console.log(`  Vectors stored  : ${count.c}`);
+  console.log(`  DB file         : ${path.resolve(DB_PATH)}`);
 
   if (totalStored > 0) {
     try { fs.unlinkSync(CHECKPOINT_FILE); } catch {}
