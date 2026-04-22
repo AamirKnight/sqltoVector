@@ -1,0 +1,36 @@
+# 🔐 Env files (never commit secrets)
+.env
+.env.*
+
+# 🐍 Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 📦 Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 🧠 Vector / data files (can get HUGE)
+*.db
+*.sqlite
+*.sqlite3
+*.parquet
+*.npy
+*.npz
+
+# 📁 Logs
+logs/
+*.log
+
+# 💻 OS files
+.DS_Store
+Thumbs.db
+
+# 🧪 Misc
+*.tmp
+*.cache
