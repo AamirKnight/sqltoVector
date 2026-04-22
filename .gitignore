@@ -22,7 +22,7 @@ yarn-error.log*
 *.parquet
 *.npy
 *.npz
-
+*.sql
 # 📁 Logs
 logs/
 *.log
